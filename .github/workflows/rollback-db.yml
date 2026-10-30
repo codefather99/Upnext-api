@@ -1,0 +1,29 @@
+name: rollback-db
+
+# MANUAL ONLY. Runs ONE down script against the deployed database and removes its Flyway history row.
+# Roll back the HIGHEST version first (for example 100 before 1). Destructive: it drops tables.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Migration version to roll back, digits only (for example 100)'
+        required: true
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the input
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          echo "$VERSION" | grep -Eq '^[0-9]+$' || { echo "version must be digits only"; exit 1; }
+          test -f "db/down/V${VERSION}__down.sql" || { echo "no down script for V${VERSION}"; exit 1; }
+      - name: Run the down script
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "db/down/V${VERSION}__down.sql"
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "DELETE FROM flyway_schema_history WHERE version = '${VERSION}'"

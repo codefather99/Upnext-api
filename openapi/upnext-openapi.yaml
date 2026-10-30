@@ -1,0 +1,598 @@
+openapi: 3.0.3
+info:
+  title: up-next API
+  version: 0.1.0
+  description: |
+    A public feedback board and roadmap. Fictional product, fictional users.
+
+    **Conventions**
+    - All paths start with `/api/v1`. JSON everywhere.
+    - Send `X-Request-Id` (UUID) on every call. The service echoes it on every response, including errors.
+    - Every error is `application/problem+json` shaped as `Problem`. Switch on `code`, never on `detail`.
+    - Visitors (no token) can browse and read the roadmap. Voting and submitting need `Authorization: Bearer <jwt>` (role USER or ADMIN). Board and status changes need role ADMIN. These are enforced in the service.
+    - **Voting is two explicit idempotent calls, not a toggle.** `PUT .../vote` means "I vote" and `DELETE .../vote` means "I do not vote". Two quick taps send the same call twice and record one vote. The screen decides which to send from `viewerHasVoted`.
+    - **Optimistic update (recommended action for the brief):** the vote button. Update the count and the button immediately, send the call, and on any failure put the old values back and show the message for the error `code` (for example `VOTING_CLOSED`).
+    - **Moving a card** sends the `version` the screen last saw as `expectedVersion`. On `409 STALE_VERSION` the problem carries `current` (the true card): put the card in its true column and tell the admin someone else moved it.
+    - Vote counts are computed from the vote records whenever read. They are never stored.
+
+    **Mock server:** `npx @stoplight/prism-cli mock openapi/upnext-openapi.yaml -p 4011`. Use `Prefer: code=409` or `Prefer: example=votingClosed` to force error states.
+servers:
+  - url: http://localhost:8081
+    description: Local service
+  - url: http://localhost:4011
+    description: Prism mock
+  - url: https://REPLACE-ME.onrender.com
+    description: Deployed service
+tags:
+  - name: Meta
+  - name: Auth
+  - name: Browse
+    description: Public. A signed-in user also gets `viewerHasVoted`.
+  - name: Participate
+    description: Signed-in USER or ADMIN.
+  - name: Admin
+    description: ADMIN only.
+
+paths:
+  /api/v1/meta:
+    get:
+      tags: [Meta]
+      operationId: getMeta
+      summary: Product name, demo flag and server time
+      x-semantics: safe, idempotent
+      security: []
+      responses:
+        '200':
+          description: OK
+          headers: { X-Request-Id: { $ref: '#/components/headers/XRequestId' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Meta' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /api/v1/auth/signup:
+    post:
+      tags: [Auth]
+      operationId: signup
+      summary: Create an account and sign in
+      description: New accounts are always role USER. Two signups with the same email (any letter case) at once give one account and one `EMAIL_TAKEN`.
+      x-semantics: unsafe, not idempotent
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SignupRequest' }
+      responses:
+        '201':
+          description: Account created
+          headers: { X-Request-Id: { $ref: '#/components/headers/XRequestId' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthResponse' }
+        '409': { $ref: '#/components/responses/EmailTaken' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /api/v1/auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: Sign in
+      x-semantics: unsafe, not idempotent
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+      responses:
+        '200':
+          description: Signed in
+          headers: { X-Request-Id: { $ref: '#/components/headers/XRequestId' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /api/v1/auth/me:
+    get:
+      tags: [Auth]
+      operationId: getMe
+      summary: Who am I (also detects an expired token)
+      x-semantics: safe, idempotent
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: OK
+          headers: { X-Request-Id: { $ref: '#/components/headers/XRequestId' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/requests:
+    get:
+      tags: [Browse]
+      operationId: listRequests
+      summary: Browse feature requests
+      description: |
+        Filters combine (AND). Omit a filter to clear it. Requests that were merged as duplicates are never listed.
+        `sort=votes` is Most Upvoted (ties: newest first). `sort=newest` is Newest.
+      x-semantics: safe, idempotent
+      security: [{}, { bearerAuth: [] }]
+      parameters:
+        - { name: tag, in: query, required: false, schema: { type: string, maxLength: 24 } }
+        - { name: status, in: query, required: false, schema: { $ref: '#/components/schemas/Status' } }
+        - { name: q, in: query, required: false, description: Keyword in the title or description (case-insensitive), schema: { type: string, maxLength: 100 } }
+        - { name: sort, in: query, required: false, schema: { type: string, enum: [votes, newest], default: votes } }
+        - { name: page, in: query, required: false, schema: { type: integer, minimum: 0, default: 0 } }
+        - { name: size, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 50, default: 20 } }
+      responses:
+        '200':
+          description: OK (items empty is the "nothing matches" or "no requests yet" state)
+          headers: { X-Request-Id: { $ref: '#/components/headers/XRequestId' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RequestPage' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '500': { $ref: '#/components/responses/ServerError' }
+    post:
+      tags: [Participate]
+      operationId: createRequest
+      summary: Submit a feature request
+      description: Starts as OPEN. Tags are lower-cased and de-duplicated by the service.
+      x-semantics: unsafe, not idempotent
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateRequest' }
+      responses:
+        '201':
+          description: Created
+          headers: { X-Request-Id: { $ref: '#/components/headers/XRequestId' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RequestItem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /api/v1/requests/{id}:
+    get:
+      tags: [Browse]
+      operationId: getRequest
+      summary: One request
+      x-semantics: safe, idempotent
+      security: [{}, { bearerAuth: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/RequestId' }
+      responses:
+        '200':
+          description: OK
+          headers: { X-Request-Id: { $ref: '#/components/headers/XRequestId' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RequestItem' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/requests/{id}/vote:
+    put:
+      tags: [Participate]
+      operationId: castVote
+      summary: Vote for this request
+      description: |
+        Safe to send twice or from two tabs at once: the database holds one vote per user per request.
+        Refused with `409 VOTING_CLOSED` once the request is COMPLETED.
+      x-semantics: unsafe, idempotent
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/RequestId' }
+      responses:
+        '200':
+          description: Vote recorded (or already recorded)
+          headers: { X-Request-Id: { $ref: '#/components/headers/XRequestId' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VoteState' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/VotingClosed' }
+    delete:
+      tags: [Participate]
+      operationId: withdrawVote
+      summary: Remove my vote
+      description: 'Idempotent, so removing a vote that does not exist is a success. Also refused with `VOTING_CLOSED` once COMPLETED.'
+      x-semantics: unsafe, idempotent
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/RequestId' }
+      responses:
+        '200':
+          description: Vote removed (or was not there)
+          headers: { X-Request-Id: { $ref: '#/components/headers/XRequestId' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VoteState' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/VotingClosed' }
+
+  /api/v1/requests/{id}/status:
+    put:
+      tags: [Admin]
+      operationId: moveRequest
+      summary: Move a card to another column
+      description: |
+        Any column to any column. `expectedVersion` is the card's `version` when the screen last loaded it.
+        If another admin moved it first the answer is `409 STALE_VERSION` with `current` holding the true card.
+        Moving to the status it already has (with a matching version) is a no-op returning 200.
+        Every real move is recorded with the admin's name and the time.
+      x-semantics: unsafe, idempotent
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/RequestId' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MoveRequest' }
+      responses:
+        '200':
+          description: Moved
+          headers: { X-Request-Id: { $ref: '#/components/headers/XRequestId' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RequestItem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/StaleVersion' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /api/v1/requests/{id}/status-history:
+    get:
+      tags: [Admin]
+      operationId: listStatusHistory
+      summary: Who moved this card, and when (oldest first)
+      x-semantics: safe, idempotent
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/RequestId' }
+      responses:
+        '200':
+          description: OK
+          headers: { X-Request-Id: { $ref: '#/components/headers/XRequestId' } }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/StatusHistoryEntry' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/board:
+    get:
+      tags: [Admin]
+      operationId: getBoard
+      summary: The admin board, four columns
+      description: Each column is ordered Most Upvoted first and holds at most 100 cards. `generatedAt` says how fresh it is.
+      x-semantics: safe, idempotent
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: OK
+          headers: { X-Request-Id: { $ref: '#/components/headers/XRequestId' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Board' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/roadmap:
+    get:
+      tags: [Browse]
+      operationId: getRoadmap
+      summary: Public roadmap (Planned, In Progress, Completed)
+      description: A query over request statuses, never a separate copy, so it always agrees with the board. OPEN requests never appear.
+      x-semantics: safe, idempotent
+      security: []
+      responses:
+        '200':
+          description: OK
+          headers: { X-Request-Id: { $ref: '#/components/headers/XRequestId' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Roadmap' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /api/v1/tags:
+    get:
+      tags: [Browse]
+      operationId: listTags
+      summary: Tags in use with how many requests carry each (for the filter list)
+      x-semantics: safe, idempotent
+      security: []
+      responses:
+        '200':
+          description: OK
+          headers: { X-Request-Id: { $ref: '#/components/headers/XRequestId' } }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/TagCount' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  headers:
+    XRequestId:
+      description: Echo of the request's X-Request-Id (generated by the service when the client sent none).
+      schema: { type: string, maxLength: 64 }
+
+  parameters:
+    RequestId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  schemas:
+    Status:
+      type: string
+      enum: [OPEN, PLANNED, IN_PROGRESS, COMPLETED]
+
+    Meta:
+      type: object
+      required: [productName, demoMode, serverTime, version]
+      properties:
+        productName: { type: string, example: up-next (demonstration) }
+        demoMode: { type: boolean, description: 'Always true. Show a "Demonstration data" banner.' }
+        serverTime: { type: string, format: date-time }
+        version: { type: string, example: 0.1.0 }
+
+    User:
+      type: object
+      required: [id, displayName, role]
+      properties:
+        id: { type: string, format: uuid }
+        displayName: { type: string }
+        role: { type: string, enum: [USER, ADMIN] }
+
+    SignupRequest:
+      type: object
+      required: [email, password, displayName]
+      properties:
+        email: { type: string, format: email, maxLength: 160 }
+        password: { type: string, minLength: 8, maxLength: 100 }
+        displayName: { type: string, minLength: 2, maxLength: 80 }
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email, maxLength: 160 }
+        password: { type: string, minLength: 1, maxLength: 100 }
+
+    AuthResponse:
+      type: object
+      required: [accessToken, tokenType, expiresInSeconds, user]
+      properties:
+        accessToken: { type: string }
+        tokenType: { type: string, enum: [Bearer] }
+        expiresInSeconds: { type: integer, description: Seconds }
+        user: { $ref: '#/components/schemas/User' }
+
+    CreateRequest:
+      type: object
+      required: [title, description]
+      properties:
+        title: { type: string, minLength: 3, maxLength: 160 }
+        description: { type: string, minLength: 10, maxLength: 4000 }
+        tags:
+          type: array
+          maxItems: 5
+          items: { type: string, pattern: '^[A-Za-z0-9-]{1,24}$' }
+
+    RequestItem:
+      type: object
+      required: [id, title, description, tags, status, voteCount, viewerHasVoted, authorName, version, createdAt, updatedAt]
+      properties:
+        id: { type: string, format: uuid }
+        title: { type: string }
+        description: { type: string }
+        tags:
+          type: array
+          items: { type: string }
+        status: { $ref: '#/components/schemas/Status' }
+        voteCount: { type: integer, minimum: 0, description: Computed from vote records when read }
+        viewerHasVoted: { type: boolean, description: False for visitors }
+        authorName: { type: string }
+        version: { type: integer, minimum: 0, description: Send back as expectedVersion when moving the card }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    RequestPage:
+      type: object
+      required: [items, page, size, totalItems]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/RequestItem' }
+        page: { type: integer }
+        size: { type: integer }
+        totalItems: { type: integer, format: int64 }
+
+    VoteState:
+      type: object
+      required: [requestId, voteCount, viewerHasVoted]
+      properties:
+        requestId: { type: string, format: uuid }
+        voteCount: { type: integer, minimum: 0 }
+        viewerHasVoted: { type: boolean }
+
+    MoveRequest:
+      type: object
+      required: [status, expectedVersion]
+      properties:
+        status: { $ref: '#/components/schemas/Status' }
+        expectedVersion: { type: integer, minimum: 0 }
+
+    StatusHistoryEntry:
+      type: object
+      required: [id, toStatus, changedBy, changedAt]
+      properties:
+        id: { type: integer, format: int64 }
+        fromStatus: { $ref: '#/components/schemas/Status' }
+        toStatus: { $ref: '#/components/schemas/Status' }
+        changedBy: { type: string, example: Chinedu (admin) }
+        changedAt: { type: string, format: date-time }
+
+    Board:
+      type: object
+      required: [open, planned, inProgress, completed, generatedAt]
+      properties:
+        open: { type: array, items: { $ref: '#/components/schemas/RequestItem' } }
+        planned: { type: array, items: { $ref: '#/components/schemas/RequestItem' } }
+        inProgress: { type: array, items: { $ref: '#/components/schemas/RequestItem' } }
+        completed: { type: array, items: { $ref: '#/components/schemas/RequestItem' } }
+        generatedAt: { type: string, format: date-time }
+
+    Roadmap:
+      type: object
+      required: [planned, inProgress, completed, generatedAt]
+      properties:
+        planned: { type: array, items: { $ref: '#/components/schemas/RequestItem' } }
+        inProgress: { type: array, items: { $ref: '#/components/schemas/RequestItem' } }
+        completed: { type: array, items: { $ref: '#/components/schemas/RequestItem' } }
+        generatedAt: { type: string, format: date-time }
+
+    TagCount:
+      type: object
+      required: [tag, count]
+      properties:
+        tag: { type: string }
+        count: { type: integer, minimum: 1 }
+
+    FieldError:
+      type: object
+      required: [field, message]
+      properties:
+        field: { type: string, example: title }
+        message: { type: string, example: Title must be 3 to 160 characters }
+
+    Problem:
+      type: object
+      description: RFC 9457 problem details plus up-next extensions. Switch on `code`.
+      required: [title, status, code, requestId]
+      properties:
+        type: { type: string, example: 'about:blank' }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string, description: Human readable. Safe to show. }
+        code:
+          type: string
+          enum: [VALIDATION_FAILED, UNAUTHENTICATED, FORBIDDEN, NOT_FOUND, EMAIL_TAKEN, VOTING_CLOSED, STALE_VERSION, INTERNAL_ERROR]
+        requestId: { type: string }
+        fieldErrors:
+          type: array
+          items: { $ref: '#/components/schemas/FieldError' }
+        current:
+          description: Present on STALE_VERSION. The card as it truly is now.
+          allOf:
+            - { $ref: '#/components/schemas/RequestItem' }
+
+  responses:
+    ValidationFailed:
+      description: Input failed validation
+      headers: { X-Request-Id: { $ref: '#/components/headers/XRequestId' } }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            title: Validation failed
+            status: 422
+            code: VALIDATION_FAILED
+            requestId: 5e1c2d0a-1111-4b6e-9a0b-6f3c1b2d7a10
+            fieldErrors:
+              - { field: title, message: Title must be 3 to 160 characters }
+    Unauthorized:
+      description: Not signed in, token expired, or wrong credentials
+      headers: { X-Request-Id: { $ref: '#/components/headers/XRequestId' } }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example: { title: Not signed in, status: 401, code: UNAUTHENTICATED, requestId: 5e1c2d0a-2222-4b6e-9a0b-6f3c1b2d7a10 }
+    Forbidden:
+      description: Signed in but not an admin
+      headers: { X-Request-Id: { $ref: '#/components/headers/XRequestId' } }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example: { title: Not allowed, status: 403, code: FORBIDDEN, requestId: 5e1c2d0a-3333-4b6e-9a0b-6f3c1b2d7a10 }
+    NotFound:
+      description: No such request
+      headers: { X-Request-Id: { $ref: '#/components/headers/XRequestId' } }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example: { title: Not found, status: 404, code: NOT_FOUND, requestId: 5e1c2d0a-4444-4b6e-9a0b-6f3c1b2d7a10 }
+    EmailTaken:
+      description: An account with this email already exists
+      headers: { X-Request-Id: { $ref: '#/components/headers/XRequestId' } }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example: { title: Email already in use, status: 409, code: EMAIL_TAKEN, detail: An account with that email already exists. Try signing in., requestId: 5e1c2d0a-5555-4b6e-9a0b-6f3c1b2d7a10 }
+    VotingClosed:
+      description: The request is COMPLETED, so voting is closed
+      headers: { X-Request-Id: { $ref: '#/components/headers/XRequestId' } }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          examples:
+            votingClosed:
+              value: { title: Voting is closed, status: 409, code: VOTING_CLOSED, detail: This request is completed, so votes can no longer change., requestId: 5e1c2d0a-6666-4b6e-9a0b-6f3c1b2d7a10 }
+    StaleVersion:
+      description: Another admin moved this card first
+      headers: { X-Request-Id: { $ref: '#/components/headers/XRequestId' } }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          examples:
+            staleVersion:
+              value:
+                title: This card has moved
+                status: 409
+                code: STALE_VERSION
+                detail: Another admin already moved this card. It is shown where it is now.
+                requestId: 5e1c2d0a-7777-4b6e-9a0b-6f3c1b2d7a10
+                current:
+                  id: 9a1a4f0e-0000-4a11-8d2e-000000000001
+                  title: Dark mode
+                  description: Please add a dark theme for night use.
+                  tags: [ui]
+                  status: IN_PROGRESS
+                  voteCount: 14
+                  viewerHasVoted: false
+                  authorName: Ada Obi
+                  version: 3
+                  createdAt: '2026-10-20T09:00:00Z'
+                  updatedAt: '2026-10-25T10:00:00Z'
+    ServerError:
+      description: Unexpected failure. Retry reads freely; voting and moving are safe to retry.
+      headers: { X-Request-Id: { $ref: '#/components/headers/XRequestId' } }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example: { title: Something went wrong, status: 500, code: INTERNAL_ERROR, requestId: 5e1c2d0a-8888-4b6e-9a0b-6f3c1b2d7a10 }
